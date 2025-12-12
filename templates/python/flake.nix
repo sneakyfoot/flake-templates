@@ -16,6 +16,12 @@
     {
       devShells.${system}.default = pkgs.mkShell {
         packages = [ python uv ];
+        shellHook = ''
+          export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+          export VIRTUAL_ENV="$UV_PROJECT_ENVIRONMENT"
+          export PATH="$VIRTUAL_ENV/bin:$PATH"
+          echo "Using venv: $UV_PROJECT_ENVIRONMENT"
+        '';
       };
 
       packages.${system}.default = pkgs.writeShellApplication {
