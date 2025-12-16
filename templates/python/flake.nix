@@ -1,65 +1,132 @@
 {
-  description = "hello-uv: minimal uv + nix flake template (x86_64-linux)";
+  description = "uv (impure dev) + uv2nix (pure ship)";
 
-  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = { self, nixpkgs }:
+    pyproject-nix = {
+      url = "github:pyproject-nix/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    uv2nix = {
+      url = "github:pyproject-nix/uv2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+    };
+
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
+    };
+  };
+
+  outputs =
+    { self
+    , nixpkgs
+    , pyproject-nix
+    , uv2nix
+    , pyproject-build-systems
+    , ...
+    }:
     let
       system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
+
+      pkgs = nixpkgs.legacyPackages.${system};
+      lib = pkgs.lib;
+
+      app = "my-cli";
+      module = "my_package";
+
+      workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
+
+      overlay = workspace.mkPyprojectOverlay {
+        sourcePreference = "wheel"; # or "sdist"
+      };
 
       python = pkgs.python314;
-      uv = pkgs.uv;
 
-      src = pkgs.lib.cleanSource ./.;
-    in
-    {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [ python uv ];
-        shellHook = ''
-          export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
-          export VIRTUAL_ENV="$UV_PROJECT_ENVIRONMENT"
-          export PATH="$VIRTUAL_ENV/bin:$PATH"
-          echo "Using venv: $UV_PROJECT_ENVIRONMENT"
+      pythonSet =
+        (pkgs.callPackage pyproject-nix.build.packages { inherit python; }).overrideScope
+          (lib.composeManyExtensions [
+            pyproject-build-systems.overlays.default
+            overlay
+
+            (final: prev: {
+              # Put "this wheel needs extra libs" fixups here when something explodes.
+              # Example:
+              # psycopg2 = prev.psycopg2.overrideAttrs (old: {
+              #   buildInputs = (old.buildInputs or []) ++ [ pkgs.postgresql ];
+              # });
+            })
+          ]);
+
+      venv = pythonSet.mkVirtualEnv "${app}-venv" workspace.deps.default;
+
+      cli = pkgs.writeShellApplication {
+        name = app;
+
+        runtimeInputs = [ venv ];
+
+        text = ''
+          exec ${venv}/bin/python -m ${module} "$@"
         '';
       };
 
-      packages.${system}.default = pkgs.writeShellApplication {
-        name = "hello-uv";
-        runtimeInputs = [ uv python ];
-        text = ''
-          set -euo pipefail
-          APP="hello-uv"
-          export UV_PYTHON="${python}/bin/python3.14"
-          # don't let uv download/choose its own python
-          export UV_NO_MANAGED_PYTHON=1
-          export UV_NO_PYTHON_DOWNLOADS=1
-          # system-level state/caching (provided by your NixOS tmpfiles)
-          export UV_PROJECT_ENVIRONMENT="''${UV_PROJECT_ENVIRONMENT:-/var/uv/venvs/$APP}"
-          export UV_CACHE_DIR="''${UV_CACHE_DIR:-/var/uv/cache}"
-          mkdir -p "$UV_PROJECT_ENVIRONMENT" "$UV_CACHE_DIR"
-          test -w "$UV_PROJECT_ENVIRONMENT" || {
-            echo "Not writable: $UV_PROJECT_ENVIRONMENT" >&2
-            echo "Fix perms via NixOS tmpfiles (/var/uv) or override UV_PROJECT_ENVIRONMENT." >&2
-            exit 1
-          }
-          test -w "$UV_CACHE_DIR" || {
-            echo "Not writable: $UV_CACHE_DIR" >&2
-            echo "Fix perms via NixOS tmpfiles (/var/uv) or override UV_CACHE_DIR." >&2
-            exit 1
-          }
-          cd ${src}
-          # converge venv to uv.lock (installs + removes), but never edits the lock
-          uv sync --frozen --no-dev
-          # run the actual console script (from [project.scripts])
-          uv run --frozen --no-dev --no-sync hello-uv "$@"
-        '';
+      nixldLibs = [
+        pkgs.stdenv.cc.cc
+        pkgs.zlib
+        pkgs.openssl
+        pkgs.libffi
+        pkgs.xz
+        pkgs.bzip2
+      ];
 
+    in
+    {
+      packages.${system} = {
+        default = cli;
+        venv = venv;
       };
 
       apps.${system}.default = {
         type = "app";
-        program = "${self.packages.${system}.default}/bin/hello-uv";
+        program = "${cli}/bin/${app}";
+      };
+
+      checks.${system}.default = self.packages.${system}.default;
+
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [
+          pkgs.uv
+
+          pkgs.git
+          pkgs.pkg-config
+          pkgs.cmake
+          pkgs.gcc
+
+          python
+        ];
+
+        env =
+          {
+            UV_PROJECT_ENVIRONMENT = ".venv";
+            UV_CACHE_DIR = ".uv-cache";
+
+            # Force uv to use nixpkgs Python (comment these out to let uv manage Python)
+            # UV_PYTHON = "${python}/bin/python3";
+            # UV_NO_MANAGED_PYTHON = "1";
+          }
+          // lib.optionalAttrs pkgs.stdenv.isLinux {
+            NIX_LD = pkgs.stdenv.cc.bintools.dynamicLinker;
+            NIX_LD_LIBRARY_PATH = lib.makeLibraryPath nixldLibs;
+          };
+
+        shellHook = ''
+          unset PYTHONPATH
+        '';
       };
     };
 }
