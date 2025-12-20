@@ -2,7 +2,7 @@
 hello-world = "hello_world.main:main"
 
 [project]
-name = "python"
+name = "hello-world"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
