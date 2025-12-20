@@ -1,6 +1,8 @@
 # --- Python venvs (anywhere) ---
 .venv/
 **/.venv/
+**/.uv-python/
+.uv-python/
 
 # --- Nix build outputs ---
 result
