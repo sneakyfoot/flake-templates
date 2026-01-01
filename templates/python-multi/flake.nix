@@ -22,6 +22,9 @@
 
       appName = "my-app";
       entrypoint = "my-app";
+
+      # This is the importable module name for the fallback `python -m ...`
+      moduleName = "my_app";
     in
     {
       devShells = forAllSystems (
@@ -39,7 +42,6 @@
             pkgs.openssl
             pkgs.stdenv.cc
           ];
-
         in
         {
           default = pkgs.mkShell {
@@ -74,7 +76,6 @@
             version = "0.1.0";
             src = self;
 
-            # Build with: --option sandbox relaxed
             __noChroot = true;
             allowSubstitutes = true;
             dontFixup = true;
@@ -88,7 +89,6 @@
               mkdir -p "$HOME"
 
               export UV_CACHE_DIR="$TMPDIR/uv-cache"
-
               export UV_MANAGED_PYTHON=1
 
               export UV_PYTHON_INSTALL_DIR="$out/python"
@@ -98,25 +98,60 @@
               uv venv --python ${pythonSpec}
               uv sync --frozen --no-dev --no-editable
 
+              # Optional: keep a runnable wrapper inside the bundle for testing
               mkdir -p "$out/bin"
+              if [ -x "$out/venv/bin/${entrypoint}" ]; then
+                makeWrapper "$out/venv/bin/${entrypoint}" "$out/bin/${entrypoint}"
+              else
+                makeWrapper "$out/venv/bin/python" "$out/bin/${entrypoint}" \
+                  --add-flags "-m ${moduleName}"
+              fi
+            '';
+          };
+
+          # Thin package: installs only bin/my-app, points at the bundle.
+          cli = pkgs.stdenvNoCC.mkDerivation {
+            pname = appName;
+            version = "0.1.0";
+
+            dontUnpack = true;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+
+            installPhase = ''
+              set -euo pipefail
+              mkdir -p "$out/bin"
+
+              # Prefer uv-generated console script
+              if [ -x "${uvBundle}/venv/bin/${entrypoint}" ]; then
+                makeWrapper "${uvBundle}/venv/bin/${entrypoint}" "$out/bin/${entrypoint}"
+              else
+                # Fallback: run module
+                makeWrapper "${uvBundle}/venv/bin/python" "$out/bin/${entrypoint}" \
+                  --add-flags "-m ${moduleName}"
+              fi
             '';
           };
         in
         {
-          ${appName} = uvBundle;
-          default = uvBundle;
+          uv-bundle = uvBundle;
+          ${appName} = cli;
+          default = cli;
         }
       );
 
       apps = forAllSystems (
         system:
         let
-          uvBundle = self.packages.${system}.${appName};
+          cli = self.packages.${system}.${appName};
         in
         {
+          ${appName} = {
+            type = "app";
+            program = "${cli}/bin/${entrypoint}";
+          };
           default = {
             type = "app";
-            program = "${uvBundle}/bin/${entrypoint}";
+            program = "${cli}/bin/${entrypoint}";
           };
         }
       );
