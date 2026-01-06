@@ -5,39 +5,72 @@
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
+      systems = [
+        "x86_64-linux"
+        "aarch64-darwin"
+      ];
+      forSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+      mkPkgs = system: import nixpkgs { inherit system; };
 
-      rust-package = pkgs.rustPlatform.buildRustPackage {
-        pname = "rust-package";
-        version = "0.1.0";
-        src = pkgs.lib.cleanSource ./.;
-        cargoLock = {
-          lockFile = ./Cargo.lock;
+      mkRustPackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "rust-package";
+          version = "0.1.0";
+          src = pkgs.lib.cleanSource ./.;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
         };
-      };
-    in {
-      packages.${system} = {
-        default = rust-package;
-        rp = rust-package;
-      };
+    in
+    {
+      packages = forSystems (
+        system:
+        let
+          pkgs = mkPkgs system;
+          rust-package = mkRustPackage pkgs;
+        in
+        {
+          default = rust-package;
+          rp = rust-package;
+        }
+      );
 
-      apps.${system}.default = {
-        type = "app";
-        program = "${rust-package}/bin/rp";
-      };
+      apps = forSystems (
+        system:
+        let
+          pkgs = mkPkgs system;
+          rust-package = mkRustPackage pkgs;
+        in
+        {
+          default = {
+            type = "app";
+            program = "${rust-package}/bin/rp";
+          };
+        }
+      );
 
-      devShells.${system}.default = pkgs.mkShell {
-        packages = with pkgs; [
-          rustc
-          cargo
-          rust-analyzer
-          rustfmt
-          pkg-config
-        ];
-        inputsFrom = [ rust-package ];
-      };
+      devShells = forSystems (
+        system:
+        let
+          pkgs = mkPkgs system;
+          rust-package = mkRustPackage pkgs;
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              rustc
+              cargo
+              rust-analyzer
+              rustfmt
+              pkg-config
+            ];
+            inputsFrom = [ rust-package ];
+          };
+        }
+      );
     };
 }
