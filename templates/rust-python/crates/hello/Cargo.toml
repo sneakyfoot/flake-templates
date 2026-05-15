@@ -1,0 +1,7 @@
+[package]
+name = "hello"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["auto-initialize"] }

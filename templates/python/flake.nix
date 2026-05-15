@@ -1,30 +1,125 @@
 {
-  description = "uv-managed Python template (impure build), with runtime GPU shim + nix-ld container";
+  description = "Master template — python ± rust accelerator. impure-uv default.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      crane,
+    }:
 
     let
       lib = nixpkgs.lib;
 
+      # ─── Edit these ────────────────────────────────────
+      appName = "hello-world";
+      entrypoint = "hello-world"; # console_scripts name in pyproject.toml
+      moduleName = "hello_world"; # `python -m <moduleName>` fallback
+      defaultRepo = "ghcr.io/USER/${appName}";
+
+      # "uv"  — impure uv-managed deps (default; ML-friendly, latest PyPI)
+      # "nix" — pure nixpkgs deps via withPackages (deterministic, no network)
+      pythonMode = "uv";
+
+      # uv mode: portable cpython spec uv will install.
+      pythonSpec = "3.13";
+
+      # nix mode: nixpkgs python attr + dep selector + module location.
+      pythonAttr = pkgs: pkgs.python313;
+      pythonNixDeps =
+        ps: with ps; [
+          # Add nixpkgs deps here, e.g.: requests rich pyyaml
+        ];
+      # Subpath under the flake root that contains the importable modules.
+      # `./src` matches the src layout this template ships with. Use `./.`
+      # for flat layouts (modules at the repo root).
+      pythonSrcDir = ./src;
+
+      # Set to `{ name = "..."; src = ./native/<name>; }` to enable a sidecar
+      # rust crate built alongside the python bundle. Output goes to bin/<name>.
+      # null disables — no Cargo.toml needed at the repo root.
+      rustAccelerator = null;
+      # rustAccelerator = { name = "${appName}-fast"; src = ./native/${appName}-fast; };
+
+      # ─── Boilerplate below ─────────────────────────────
       systems = [
         "x86_64-linux"
         "aarch64-darwin"
       ];
-
       forAllSystems = f: lib.genAttrs systems (system: f system);
 
-      pythonSpec = "3.14.2";
+      perSystem =
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
+          isLinux = pkgs.stdenv.isLinux;
+          craneLib = crane.mkLib pkgs;
 
-      appName = "my-app";
-      entrypoint = "my-app";
+          pythonUv = import ./nix/python-uv.nix {
+            inherit
+              pkgs
+              lib
+              appName
+              entrypoint
+              pythonSpec
+              ;
+            src = ./.;
+          };
 
-      # NixOS GPU shim
-      gpuLibPath = "/run/opengl-driver/lib:/run/opengl-driver-32/lib";
+          pythonNix = import ./nix/python-nix.nix {
+            inherit
+              pkgs
+              lib
+              appName
+              entrypoint
+              moduleName
+              pythonSrcDir
+              ;
+            python = pythonAttr pkgs;
+            depsFn = pythonNixDeps;
+            src = ./.;
+          };
+
+          py = if pythonMode == "uv" then pythonUv else pythonNix;
+
+          rust =
+            if rustAccelerator == null then
+              null
+            else
+              import ./nix/rust.nix {
+                inherit pkgs craneLib;
+                inherit (rustAccelerator) name src;
+              };
+
+          image = import ./nix/image.nix {
+            inherit
+              pkgs
+              lib
+              appName
+              defaultRepo
+              ;
+            cli = py.cli;
+            extraBin = if rust == null then [ ] else [ rust.package ];
+            needsNixLd = pythonMode == "uv";
+          };
+        in
+        {
+          inherit
+            pkgs
+            isLinux
+            py
+            rust
+            image
+            ;
+        };
 
     in
     {
@@ -32,42 +127,20 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
-
-          toolchain = [
-            pkgs.uv
-            pkgs.ruff
-            pkgs.cacert
-            pkgs.makeWrapper
-            pkgs.ty
-            pkgs.zlib
-            pkgs.openssl
-            pkgs.stdenv.cc
-          ];
-
-          isLinux = pkgs.stdenv.isLinux;
-
+          s = perSystem system;
         in
         {
-          default = pkgs.mkShell {
-            packages = toolchain;
-
-            env = {
-              UV_MANAGED_PYTHON = "1";
-              UV_PROJECT_ENVIRONMENT = ".venv";
-            };
-
-            shellHook = ''
-              set -euo pipefail
-
-
-              ${lib.optionalString isLinux ''
-                # GPU shim for local dev on NixOS
-                if [ -d /run/opengl-driver/lib ]; then
-                  export LD_LIBRARY_PATH="${gpuLibPath}:''${LD_LIBRARY_PATH:-}"
-                fi
-              ''}
-            '';
+          default = s.pkgs.mkShell {
+            packages =
+              s.py.devInputs
+              ++ lib.optionals (s.rust != null) s.rust.devInputs
+              ++ (with s.pkgs; [
+                git
+                nixfmt
+                nixd
+              ]);
+            inherit (s.py) env;
+            shellHook = s.py.shellHook;
           };
         }
       );
@@ -75,164 +148,55 @@
       packages = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
-
-          isLinux = pkgs.stdenv.isLinux;
-
-          toolchain = [
-            pkgs.uv
-            pkgs.ruff
-            pkgs.cacert
-            pkgs.makeWrapper
-            pkgs.ty
-            pkgs.zlib
-            pkgs.openssl
-            pkgs.stdenv.cc
-          ];
-
-          uvBundle = pkgs.stdenvNoCC.mkDerivation {
-            pname = "${appName}-uv-bundle";
-            version = "0.1.0";
-            src = ./.;
-
-            # Requires relaxed sandbox / network
-            __noChroot = true;
-            allowSubstitutes = true;
-            dontFixup = true;
-
-            nativeBuildInputs = toolchain;
-
-            installPhase = ''
-              set -euo pipefail
-
-
-              export HOME="$TMPDIR/home"
-              mkdir -p "$HOME"
-
-              export UV_CACHE_DIR="$TMPDIR/uv-cache"
-              export UV_MANAGED_PYTHON=1
-
-              export UV_PYTHON_INSTALL_DIR="$out/python"
-              export UV_PROJECT_ENVIRONMENT="$out/venv"
-
-              uv python install ${pythonSpec}
-              uv venv --python ${pythonSpec}
-              uv sync --frozen --no-dev --no-editable
-            '';
-          };
-
-          cli = pkgs.stdenvNoCC.mkDerivation {
-            pname = appName;
-            version = "0.1.0";
-
-            dontUnpack = true;
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-
-            installPhase = ''
-              set -euo pipefail
-              mkdir -p "$out/bin"
-
-
-              makeWrapper "${uvBundle}/venv/bin/${entrypoint}" "$out/bin/${entrypoint}" \
-                --run 'if [ -d /run/opengl-driver/lib ]; then export LD_LIBRARY_PATH="${gpuLibPath}:''${LD_LIBRARY_PATH:-}"; fi'
-            '';
-          };
-
-          libDir = "/lib64";
-
-          nixLdSetup = pkgs.runCommand "nix-ld-setup" { } ''
-            set -euo pipefail
-            mkdir -p "$out${libDir}"
-            install -D -m755 ${pkgs.nix-ld}/libexec/nix-ld \
-              "$out${libDir}/$(basename ${pkgs.stdenv.cc.bintools.dynamicLinker})"
-          '';
-
-          image = pkgs.dockerTools.buildImage {
-            name = appName;
-            tag = "latest";
-
-            copyToRoot = pkgs.buildEnv {
-              name = "image-root";
-
-              paths = [
-                cli
-                uvBundle
-
-                pkgs.coreutils
-                pkgs.bash
-                pkgs.git
-                pkgs.findutils
-                pkgs.cacert
-
-                # nix-ld shim at /lib64/...
-                nixLdSetup
-              ];
-
-              pathsToLink = [
-                "/bin"
-                "/lib"
-                "/lib64"
-                "/usr"
-              ];
-            };
-
-            config = {
-              Env = [
-                "NIX_LD=${pkgs.stdenv.cc.bintools.dynamicLinker}"
-                "NIX_LD_LIBRARY_PATH=${
-                  pkgs.lib.makeLibraryPath [
-                    pkgs.stdenv.cc.cc.lib
-                    pkgs.glibc
-                    pkgs.zlib
-                    pkgs.openssl
-                  ]
-                }"
-
-                # NVIDIA runtime typically injects libs here:
-                "LD_LIBRARY_PATH=/usr/lib64"
-              ];
-
-              Cmd = [ "${cli}/bin/${entrypoint}" ];
-            };
-
-            runAsRoot = ''
-              #!${pkgs.runtimeShell}
-              set -euo pipefail
-              mkdir -p /etc/ssl/certs
-              ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
-              ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt
-            '';
-          };
-
+          s = perSystem system;
         in
-        {
-          uv-bundle = uvBundle;
-          ${appName} = cli;
-
-          default = cli;
+        s.py.packages
+        // lib.optionalAttrs (s.rust != null) { ${rustAccelerator.name} = s.rust.package; }
+        // lib.optionalAttrs s.isLinux {
+          image = s.image.image;
+          push-image = s.image.pushApp;
         }
-        // lib.optionalAttrs isLinux {
-          image = image;
+        // {
+          ${appName} = s.py.cli;
+          default = s.py.cli;
         }
       );
 
       apps = forAllSystems (
         system:
         let
-          cli = self.packages.${system}.${appName};
+          s = perSystem system;
         in
         {
           ${appName} = {
             type = "app";
-            program = "${cli}/bin/${entrypoint}";
+            program = "${s.py.cli}/bin/${entrypoint}";
           };
-
           default = {
             type = "app";
-            program = "${cli}/bin/${entrypoint}";
+            program = "${s.py.cli}/bin/${entrypoint}";
+          };
+        }
+        // lib.optionalAttrs (s.rust != null) {
+          ${rustAccelerator.name} = {
+            type = "app";
+            program = "${s.rust.package}/bin/${rustAccelerator.name}";
+          };
+        }
+        // lib.optionalAttrs s.isLinux {
+          push-image = {
+            type = "app";
+            program = "${s.image.pushApp}/bin/${appName}-push";
           };
         }
       );
 
+      checks = forAllSystems (
+        system:
+        let
+          s = perSystem system;
+        in
+        s.py.checks // lib.optionalAttrs (s.rust != null) s.rust.checks
+      );
     };
 }
